@@ -21,18 +21,44 @@ from typing import Any
 # ─────────────────────────────────────────────
 
 def web_search(query: str) -> str:
-    """Search the web using DuckDuckGo's Instant Answer API."""
+    """Search for information using Wikipedia and DuckDuckGo APIs."""
     import ssl
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_redirect=1&no_html=1"
+    import re as _re
 
     ssl_ctx = ssl.create_default_context()
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    # Try Instant Answer API first
+    # ── Try 1: Wikipedia search API ──────────────────
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "multi-tool-agent/1.0"})
+        encoded = urllib.parse.quote_plus(query)
+        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded}&format=json&srlimit=3"
+        req = urllib.request.Request(wiki_url, headers={"User-Agent": "multi-tool-agent/1.0 (educational project)"})
+        with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
+            data = json.loads(resp.read().decode())
+
+        hits = data.get("query", {}).get("search", [])
+        if hits:
+            # Get the top result's extract
+            title = hits[0]["title"]
+            extract_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles={urllib.parse.quote_plus(title)}&format=json"
+            req2 = urllib.request.Request(extract_url, headers={"User-Agent": "multi-tool-agent/1.0"})
+            with urllib.request.urlopen(req2, timeout=8, context=ssl_ctx) as resp2:
+                edata = json.loads(resp2.read().decode())
+            pages = edata.get("query", {}).get("pages", {})
+            for page in pages.values():
+                extract = page.get("extract", "")
+                if extract:
+                    # Return first 500 chars
+                    return extract[:500].strip()
+    except Exception:
+        pass
+
+    # ── Try 2: DuckDuckGo Instant Answer API ─────────
+    try:
+        encoded = urllib.parse.quote_plus(query)
+        url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_redirect=1&no_html=1"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
         with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode())
 
@@ -40,43 +66,15 @@ def web_search(query: str) -> str:
             return data["AbstractText"]
 
         topics = data.get("RelatedTopics", [])
-        results = []
-        for t in topics[:3]:
-            if isinstance(t, dict) and t.get("Text"):
-                results.append(t["Text"])
-
+        results = [t["Text"] for t in topics[:3] if isinstance(t, dict) and t.get("Text")]
         if results:
-            return "\n".join(results)
+            return "
+".join(results)
 
     except Exception:
         pass
 
-    # Fallback: scrape DuckDuckGo HTML results
-    try:
-        import re
-        encoded = urllib.parse.quote_plus(query)
-        html_url = f"https://html.duckduckgo.com/html/?q={encoded}"
-        req2 = urllib.request.Request(
-            html_url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; multi-tool-agent/1.0)"}
-        )
-        with urllib.request.urlopen(req2, timeout=10, context=ssl_ctx) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
-
-        # Extract result snippets
-        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets[:3]]
-        snippets = [s for s in snippets if s]
-
-        if snippets:
-            return "\n".join(snippets)
-
-        return f"No results found for: '{query}'."
-
-    except Exception as e:
-        return f"Search error: {e}"
-
-
+    return f"Could not retrieve results for: \"{query}\". The agent will answer from its training knowledge."
 # ─────────────────────────────────────────────
 # Tool 2: Calculator  (safe math eval)
 # ─────────────────────────────────────────────
