@@ -22,12 +22,17 @@ from typing import Any
 
 def web_search(query: str) -> str:
     """Search the web using DuckDuckGo's Instant Answer API."""
+    import ssl
     encoded = urllib.parse.quote_plus(query)
     url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_redirect=1&no_html=1"
 
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "multi-tool-agent/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode())
 
         # Try AbstractText first, then RelatedTopics
