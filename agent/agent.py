@@ -1,18 +1,9 @@
 """
 agent.py — The main ReAct loop.
-
-Flow per query:
-  1. Send query + tool schemas to Ollama
-  2. LLM either answers directly OR returns a tool call JSON
-  3. If tool call → execute → send result back to LLM
-  4. Repeat up to MAX_STEPS times
-  5. Return final answer
-
-This is the key difference from document-agent:
-  The LLM decides which tool (if any) to call — not the programmer.
 """
 
 import json
+import re
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
@@ -22,8 +13,8 @@ from agent.tool_executor import run_tool_call, ToolCallError
 
 # ── Config ───────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/chat"
-DEFAULT_MODEL = "llama3.2"   # change to any model you have pulled
-MAX_STEPS = 6                # max tool calls per query
+DEFAULT_MODEL = "gemma3:12b"
+MAX_STEPS = 6
 
 
 # ── Build the system prompt ──────────────────
@@ -32,38 +23,32 @@ def _build_system_prompt() -> str:
     schemas = [t["schema"] for t in TOOLS.values()]
     schemas_json = json.dumps(schemas, indent=2)
 
-    return f"""You are a helpful AI assistant with access to the following tools:
+    return f"""You are a helpful AI assistant with access to tools.
 
+AVAILABLE TOOLS:
 {schemas_json}
 
-## How to use tools
+STRICT RULES FOR TOOL USE:
+1. When you need a tool, output ONLY this JSON — no text before or after:
+{{"tool": "<tool_name>", "args": {{"<arg_name>": "<arg_value>"}}}}
 
-When you need to use a tool, respond with ONLY a JSON object in this exact format:
-{{
-  "tool": "<tool_name>",
-  "args": {{
-    "<arg_name>": "<arg_value>"
-  }}
-}}
+2. NEVER do math in your head — always use the calculate tool.
+3. ALWAYS use web_search for any factual question about people, places, history, or current events.
+4. Use run_python for generating lists, data processing, or code execution.
+5. After getting a tool result, give a plain text final answer.
+6. Do NOT wrap your final answer in JSON.
 
-Do NOT add any text before or after the JSON when calling a tool.
-
-After receiving a tool result, you may call another tool OR provide your final answer as plain text.
-
-When you have enough information, respond with a plain text answer — do NOT wrap it in JSON.
-
-## Rules
-- Use web_search for current facts, news, or anything you're unsure about.
-- Use calculate for any math — never do arithmetic in your head.
-- Use run_python for data processing, generating lists, string manipulation, or anything needing real computation.
-- Be concise. Don't repeat the tool result verbatim — summarize and explain.
+EXAMPLE:
+User: What is sqrt(144)?
+Assistant: {{"tool": "calculate", "args": {{"expression": "sqrt(144)"}}}}
+[tool result: sqrt(144) = 12.0]
+Assistant: The square root of 144 is 12.
 """
 
 
 # ── Ollama client ────────────────────────────
 
 def _call_ollama(messages: list[dict], model: str) -> str:
-    """Send messages to Ollama and return the assistant's response text."""
     payload = json.dumps({
         "model": model,
         "messages": messages,
@@ -92,13 +77,11 @@ def _call_ollama(messages: list[dict], model: str) -> str:
 
 @dataclass
 class Step:
-    type: str          # "tool_call" | "tool_result" | "answer"
+    type: str
     content: str
     tool_name: Optional[str] = None
     tool_args: Optional[str] = None
 
-
-# ── Main agent ───────────────────────────────
 
 @dataclass
 class AgentResponse:
@@ -107,23 +90,51 @@ class AgentResponse:
     model: str = DEFAULT_MODEL
 
 
+# ── Tool call detection ──────────────────────
+
+def _extract_json(text: str) -> Optional[str]:
+    """
+    Extract a JSON tool call from LLM response.
+    Handles: raw JSON, ```json fences, ```tool fences, JSON mixed in text.
+    """
+    stripped = text.strip()
+
+    # Try 1: pure JSON starting with {
+    if stripped.startswith("{"):
+        candidate = stripped.split("```")[0].strip()
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            pass
+
+    # Try 2: fenced block ```json ... ``` or ```tool ... ```
+    match = re.search(r"```(?:json|tool)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # Try 3: any {...} containing "tool" and "args"
+    match = re.search(r'\{[^{}]*"tool"[^{}]*"args"[^{}]*\}', stripped, re.DOTALL)
+    if match:
+        return match.group(0).strip()
+
+    return None
+
+
 def _is_tool_call(text: str) -> bool:
-    """Heuristic: does this look like a tool call JSON?"""
-    stripped = text.strip().lstrip("```json").lstrip("```").strip()
-    if not stripped.startswith("{"):
+    candidate = _extract_json(text)
+    if not candidate:
         return False
     try:
-        data = json.loads(stripped if not stripped.endswith("```") else stripped[:-3])
+        data = json.loads(candidate)
         return "tool" in data and "args" in data
     except json.JSONDecodeError:
         return False
 
 
+# ── Main agent loop ──────────────────────────
+
 def run_agent(query: str, model: str = DEFAULT_MODEL) -> AgentResponse:
-    """
-    Run the full ReAct loop for a single query.
-    Returns the final answer and a trace of all steps taken.
-    """
     system_prompt = _build_system_prompt()
     messages = [
         {"role": "system", "content": system_prompt},
@@ -135,43 +146,31 @@ def run_agent(query: str, model: str = DEFAULT_MODEL) -> AgentResponse:
         response = _call_ollama(messages, model)
 
         if _is_tool_call(response):
-            # ── Tool call branch ──
-            steps.append(Step(
-                type="tool_call",
-                content=response,
-                tool_name=None,
-                tool_args=None,
-            ))
+            steps.append(Step(type="tool_call", content=response))
 
+            # Use the extracted JSON for execution
+            clean_json = _extract_json(response)
             try:
-                tool_name, args_str, result = run_tool_call(response)
+                tool_name, args_str, result = run_tool_call(clean_json)
                 steps[-1].tool_name = tool_name
                 steps[-1].tool_args = args_str
                 result_str = str(result)
-
             except ToolCallError as e:
                 result_str = f"Tool error: {e}"
                 tool_name = "unknown"
 
-            steps.append(Step(
-                type="tool_result",
-                content=result_str,
-                tool_name=tool_name,
-            ))
+            steps.append(Step(type="tool_result", content=result_str, tool_name=tool_name))
 
-            # Feed result back to LLM
             messages.append({"role": "assistant", "content": response})
             messages.append({
                 "role": "user",
-                "content": f"Tool result for {tool_name}:\n{result_str}\n\nContinue."
+                "content": f"Tool result for {tool_name}:\n{result_str}\n\nNow give your final answer in plain text."
             })
 
         else:
-            # ── Final answer branch ──
             steps.append(Step(type="answer", content=response))
             return AgentResponse(answer=response, steps=steps, model=model)
 
-    # Fallback if MAX_STEPS reached without a plain answer
-    fallback = "I reached the maximum number of steps without a final answer. Please try rephrasing your question."
+    fallback = "Reached maximum steps without a final answer. Please rephrase your question."
     steps.append(Step(type="answer", content=fallback))
     return AgentResponse(answer=fallback, steps=steps, model=model)
