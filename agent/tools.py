@@ -30,12 +30,12 @@ def web_search(query: str) -> str:
     ssl_ctx.check_hostname = False
     ssl_ctx.verify_mode = ssl.CERT_NONE
 
+    # Try Instant Answer API first
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "multi-tool-agent/1.0"})
         with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
             data = json.loads(resp.read().decode())
 
-        # Try AbstractText first, then RelatedTopics
         if data.get("AbstractText"):
             return data["AbstractText"]
 
@@ -48,7 +48,30 @@ def web_search(query: str) -> str:
         if results:
             return "\n".join(results)
 
-        return f"No instant answer found for: '{query}'. Try rephrasing."
+    except Exception:
+        pass
+
+    # Fallback: scrape DuckDuckGo HTML results
+    try:
+        import re
+        encoded = urllib.parse.quote_plus(query)
+        html_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+        req2 = urllib.request.Request(
+            html_url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; multi-tool-agent/1.0)"}
+        )
+        with urllib.request.urlopen(req2, timeout=10, context=ssl_ctx) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        # Extract result snippets
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        snippets = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets[:3]]
+        snippets = [s for s in snippets if s]
+
+        if snippets:
+            return "\n".join(snippets)
+
+        return f"No results found for: '{query}'."
 
     except Exception as e:
         return f"Search error: {e}"
