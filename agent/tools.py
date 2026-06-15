@@ -1,8 +1,5 @@
 """
 tools.py — The 3 tools the agent can call.
-
-Each tool is a plain Python function.
-The schema dict tells the LLM what each tool does and what args it takes.
 """
 
 import ast
@@ -13,79 +10,107 @@ import urllib.request
 import json
 import tempfile
 import os
+import ssl
+import re
 from typing import Any
 
 
 # ─────────────────────────────────────────────
-# Tool 1: Web Search  (DuckDuckGo Instant API)
+# Shared SSL context
+# ─────────────────────────────────────────────
+
+def _ssl_ctx():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# ─────────────────────────────────────────────
+# Tool 1: Web Search
 # ─────────────────────────────────────────────
 
 def web_search(query: str) -> str:
     """Search for information using Wikipedia and DuckDuckGo APIs."""
-    import ssl
-    import re as _re
+    ctx = _ssl_ctx()
+    encoded = urllib.parse.quote_plus(query)
 
-    ssl_ctx = ssl.create_default_context()
-    ssl_ctx.check_hostname = False
-    ssl_ctx.verify_mode = ssl.CERT_NONE
-
-    # ── Try 1: Wikipedia search API ──────────────────
+    # Try 1: Wikipedia search + extract
     try:
-        encoded = urllib.parse.quote_plus(query)
-        wiki_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={encoded}&format=json&srlimit=3"
-        req = urllib.request.Request(wiki_url, headers={"User-Agent": "multi-tool-agent/1.0 (educational project)"})
-        with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
+        wiki_search = (
+            "https://en.wikipedia.org/w/api.php"
+            "?action=query&list=search"
+            f"&srsearch={encoded}&format=json&srlimit=3"
+        )
+        req = urllib.request.Request(
+            wiki_search,
+            headers={"User-Agent": "multi-tool-agent/1.0 (educational project)"}
+        )
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
             data = json.loads(resp.read().decode())
 
         hits = data.get("query", {}).get("search", [])
         if hits:
-            # Get the top result's extract
-            title = hits[0]["title"]
-            extract_url = f"https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=true&explaintext=true&titles={urllib.parse.quote_plus(title)}&format=json"
-            req2 = urllib.request.Request(extract_url, headers={"User-Agent": "multi-tool-agent/1.0"})
-            with urllib.request.urlopen(req2, timeout=8, context=ssl_ctx) as resp2:
+            title = urllib.parse.quote_plus(hits[0]["title"])
+            extract_url = (
+                "https://en.wikipedia.org/w/api.php"
+                "?action=query&prop=extracts&exintro=true&explaintext=true"
+                f"&titles={title}&format=json"
+            )
+            req2 = urllib.request.Request(
+                extract_url,
+                headers={"User-Agent": "multi-tool-agent/1.0"}
+            )
+            with urllib.request.urlopen(req2, timeout=8, context=ctx) as resp2:
                 edata = json.loads(resp2.read().decode())
+
             pages = edata.get("query", {}).get("pages", {})
             for page in pages.values():
                 extract = page.get("extract", "")
                 if extract:
-                    # Return first 500 chars
                     return extract[:500].strip()
     except Exception:
         pass
 
-    # ── Try 2: DuckDuckGo Instant Answer API ─────────
+    # Try 2: DuckDuckGo Instant Answer
     try:
-        encoded = urllib.parse.quote_plus(query)
-        url = f"https://api.duckduckgo.com/?q={encoded}&format=json&no_redirect=1&no_html=1"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"})
-        with urllib.request.urlopen(req, timeout=8, context=ssl_ctx) as resp:
+        ddg_url = (
+            f"https://api.duckduckgo.com/?q={encoded}"
+            "&format=json&no_redirect=1&no_html=1"
+        )
+        req = urllib.request.Request(
+            ddg_url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"}
+        )
+        with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
             data = json.loads(resp.read().decode())
 
         if data.get("AbstractText"):
             return data["AbstractText"]
 
         topics = data.get("RelatedTopics", [])
-        results = [t["Text"] for t in topics[:3] if isinstance(t, dict) and t.get("Text")]
+        results = [
+            t["Text"] for t in topics[:3]
+            if isinstance(t, dict) and t.get("Text")
+        ]
         if results:
-            return "
-".join(results)
+            return "\n".join(results)
 
     except Exception:
         pass
 
-    return f"Could not retrieve results for: \"{query}\". The agent will answer from its training knowledge."
+    return f'No results found for: "{query}". Answering from training knowledge.'
+
+
 # ─────────────────────────────────────────────
-# Tool 2: Calculator  (safe math eval)
+# Tool 2: Calculator
 # ─────────────────────────────────────────────
 
-# Whitelist of safe names for the evaluator
 _SAFE_NAMES = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
 _SAFE_NAMES.update({"abs": abs, "round": round, "min": min, "max": max, "sum": sum})
 
 
 def _safe_eval(expr: str) -> Any:
-    """Parse and evaluate a math expression using AST — no exec/eval with globals."""
     tree = ast.parse(expr, mode="eval")
 
     def _eval(node):
@@ -120,13 +145,13 @@ def _safe_eval(expr: str) -> Any:
             fn = _eval(node.func)
             args = [_eval(a) for a in node.args]
             return fn(*args)
-        raise ValueError(f"Unsupported expression node: {type(node).__name__}")
+        raise ValueError(f"Unsupported node: {type(node).__name__}")
 
     return _eval(tree)
 
 
 def calculate(expression: str) -> str:
-    """Evaluate a math expression safely. Supports +,-,*,/,**,%, math functions."""
+    """Evaluate a math expression safely."""
     try:
         result = _safe_eval(expression.strip())
         return f"{expression} = {result}"
@@ -137,7 +162,7 @@ def calculate(expression: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool 3: Python Runner  (subprocess sandbox)
+# Tool 3: Python Runner
 # ─────────────────────────────────────────────
 
 _BLOCKED_IMPORTS = [
@@ -147,11 +172,10 @@ _BLOCKED_IMPORTS = [
 
 
 def run_python(code: str) -> str:
-    """Run a short Python snippet and return its stdout. 10s timeout, no network."""
-    # Basic safety check
+    """Execute a short Python snippet and return stdout."""
     for blocked in _BLOCKED_IMPORTS:
         if blocked in code:
-            return f"Blocked: '{blocked}' is not allowed in sandboxed execution."
+            return f"Blocked: '{blocked}' is not allowed."
 
     with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
         f.write(code)
@@ -163,7 +187,7 @@ def run_python(code: str) -> str:
             capture_output=True,
             text=True,
             timeout=10,
-            env={**os.environ, "PYTHONPATH": ""},  # clean env
+            env={**os.environ, "PYTHONPATH": ""},
         )
         output = result.stdout.strip()
         error = result.stderr.strip()
@@ -183,7 +207,7 @@ def run_python(code: str) -> str:
 
 
 # ─────────────────────────────────────────────
-# Tool Registry — what the LLM sees
+# Tool Registry
 # ─────────────────────────────────────────────
 
 TOOLS = {
@@ -191,13 +215,13 @@ TOOLS = {
         "fn": web_search,
         "schema": {
             "name": "web_search",
-            "description": "Search the web for current information. Use when asked about recent events, facts, or anything you are uncertain about.",
+            "description": "Search the web for current information, facts, people, history, or anything you are uncertain about.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query, written as a natural search phrase."
+                        "description": "The search query as a natural phrase."
                     }
                 },
                 "required": ["query"]
@@ -214,7 +238,7 @@ TOOLS = {
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "A valid Python math expression, e.g. '2 ** 10', 'sqrt(144)', '(3 + 4) * 2'."
+                        "description": "A valid Python math expression, e.g. '2 ** 10', 'sqrt(144)'."
                     }
                 },
                 "required": ["expression"]
@@ -225,13 +249,13 @@ TOOLS = {
         "fn": run_python,
         "schema": {
             "name": "run_python",
-            "description": "Execute a short Python code snippet and return its stdout. Use for data processing, list manipulation, string operations, or anything needing real computation.",
+            "description": "Execute a short Python code snippet and return its stdout.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Valid Python 3 code. Must print output to stdout to see results."
+                        "description": "Valid Python 3 code. Must print output to stdout."
                     }
                 },
                 "required": ["code"]
