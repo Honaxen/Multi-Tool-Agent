@@ -14,7 +14,7 @@ from agent.tool_executor import run_tool_call, ToolCallError
 # ── Config ───────────────────────────────────
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "gemma3:12b"
-MAX_STEPS = 6
+MAX_STEPS = 8
 
 
 # ── Build the system prompt ──────────────────
@@ -28,21 +28,28 @@ def _build_system_prompt() -> str:
 AVAILABLE TOOLS:
 {schemas_json}
 
-STRICT RULES FOR TOOL USE:
-1. When you need a tool, output ONLY this JSON — no text before or after:
+STRICT RULES — READ CAREFULLY:
+1. ONE action per response. Either call ONE tool OR give a final answer. Never both.
+2. To call a tool, output ONLY this JSON with no text before or after:
 {{"tool": "<tool_name>", "args": {{"<arg_name>": "<arg_value>"}}}}
 
-2. NEVER do math in your head — always use the calculate tool.
-3. ALWAYS use web_search for any factual question about people, places, history, or current events.
-4. Use run_python for generating lists, data processing, or code execution.
-5. After getting a tool result, give a plain text final answer.
-6. Do NOT wrap your final answer in JSON.
+3. NEVER do math in your head — always use the calculate tool.
+4. ALWAYS use web_search for facts about people, places, history, or current events.
+5. After receiving a tool result, you may call another tool OR give your final plain text answer.
+6. Your final answer must be plain text only — NO JSON, NO tool calls.
 
-EXAMPLE:
-User: What is sqrt(144)?
-Assistant: {{"tool": "calculate", "args": {{"expression": "sqrt(144)"}}}}
-[tool result: sqrt(144) = 12.0]
-Assistant: The square root of 144 is 12.
+EXAMPLES:
+User: What is 2^10?
+You: {{"tool": "calculate", "args": {{"expression": "2 ** 10"}}}}
+[tool result: 2 ** 10 = 1024]
+You: 2 to the power of 10 is 1024.
+
+User: What year was Python created? Then calculate sqrt of that year.
+You: {{"tool": "web_search", "args": {{"query": "year Python programming language created"}}}}
+[tool result: Python was first released in 1991.]
+You: {{"tool": "calculate", "args": {{"expression": "sqrt(1991)"}}}}
+[tool result: sqrt(1991) = 44.62]
+You: Python was created in 1991. The square root of 1991 is approximately 44.62.
 """
 
 
@@ -95,11 +102,11 @@ class AgentResponse:
 def _extract_json(text: str) -> Optional[str]:
     """
     Extract a JSON tool call from LLM response.
-    Handles: raw JSON, ```json fences, ```tool fences, JSON mixed in text.
+    Handles: raw JSON, fenced blocks, JSON embedded in text.
     """
     stripped = text.strip()
 
-    # Try 1: pure JSON starting with {
+    # Try 1: pure JSON
     if stripped.startswith("{"):
         candidate = stripped.split("```")[0].strip()
         try:
@@ -113,8 +120,8 @@ def _extract_json(text: str) -> Optional[str]:
     if match:
         return match.group(1).strip()
 
-    # Try 3: any {...} containing "tool" and "args"
-    match = re.search(r'\{[^{}]*"tool"[^{}]*"args"[^{}]*\}', stripped, re.DOTALL)
+    # Try 3: any {"tool": ..., "args": ...} anywhere in the text
+    match = re.search(r'\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[^{}]*\}\s*\}', stripped, re.DOTALL)
     if match:
         return match.group(0).strip()
 
@@ -148,7 +155,6 @@ def run_agent(query: str, model: str = DEFAULT_MODEL) -> AgentResponse:
         if _is_tool_call(response):
             steps.append(Step(type="tool_call", content=response))
 
-            # Use the extracted JSON for execution
             clean_json = _extract_json(response)
             try:
                 tool_name, args_str, result = run_tool_call(clean_json)
@@ -164,7 +170,11 @@ def run_agent(query: str, model: str = DEFAULT_MODEL) -> AgentResponse:
             messages.append({"role": "assistant", "content": response})
             messages.append({
                 "role": "user",
-                "content": f"Tool result for {tool_name}:\n{result_str}\n\nNow give your final answer in plain text."
+                "content": (
+                    f"Tool result for {tool_name}:\n{result_str}\n\n"
+                    "If you need another tool, call it now. "
+                    "Otherwise give your final plain text answer with NO JSON."
+                )
             })
 
         else:
