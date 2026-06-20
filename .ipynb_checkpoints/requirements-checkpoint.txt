@@ -1,6 +1,0 @@
-ollama
-fastapi
-uvicorn[standard]
-gradio
-pydantic
-pytest
